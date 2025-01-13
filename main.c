@@ -1,7 +1,12 @@
+#define _FILE_OFFSET_BITS 64
 #include <stdio.h>
 #include <elf.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+extern int startup(int argc, char **argv, void (*start)());
 
 const char *phdr_type_to_string(uint32_t type) {
     switch (type) {
@@ -70,6 +75,45 @@ int foreach_phdr(void *map_start, void (*func)(Elf32_Phdr *,int), int arg){
     return 0;
 }
 
+int protection_Map(int flag)
+{
+    if (flag == 0)
+        return 0;
+    if (flag == 1)
+        return PROT_EXEC;
+    if (flag == 2)
+        return PROT_WRITE;
+    if (flag == 3)
+        return PROT_WRITE | PROT_EXEC;
+    if (flag == 4)
+        return PROT_READ;
+    if (flag == 5)
+        return PROT_READ | PROT_EXEC;
+    if (flag == 6)
+        return PROT_READ | PROT_WRITE;
+    if (flag == 7)
+        return PROT_READ | PROT_WRITE | PROT_EXEC;
+    return -1;
+}
+
+void load_phdr(Elf32_Phdr *phdr, int fd) //map a program header segment into memory
+{
+    
+    if (phdr->p_type == PT_LOAD)
+    {
+        print_phdr_info(phdr, 0);
+        void *vadd = (void *)(phdr->p_vaddr & 0xfffff000);
+        int offset = phdr->p_offset & 0xfffff000;
+        int padding = phdr->p_vaddr & 0xfff;
+        int convertedFlag = protection_Map(phdr->p_flags);
+        if (mmap(vadd, phdr->p_memsz + padding, convertedFlag, MAP_FIXED | MAP_PRIVATE, fd, offset) == MAP_FAILED)
+        {
+            perror("mmap failed1");
+            exit(-1);
+        }
+    }
+}
+
 
 
 int main(int argc, char** argv){
@@ -78,34 +122,82 @@ int main(int argc, char** argv){
         return 1;
     }
 
-    FILE *file = fopen(argv[1], "rb");
-    if (!file) {
-        perror("Error opening file");
+    int fd = open(argv[1], O_RDONLY);
+    if(fd < 0) {
+        perror("open failed");
         return 1;
     }
 
-    // Get the file size
-    fseek(file, 0, SEEK_END);
-    long file_size = ftell(file);
-    fseek(file, 0, SEEK_SET);
+    struct stat fd_stat;
+    if (fstat(fd, &fd_stat) == -1)
+    {
+        perror("fstat");
+        close(fd);
+        return 1;
+    }
+    void *map_start =mmap(0, fd_stat.st_size, PROT_READ , MAP_PRIVATE, fd, 0);
+
+    if (map_start == MAP_FAILED)
+    {
+        perror("mmap failed");
+        close(fd);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Type Offset VirtAddr PhysAddr FileSiz MemSiz Flg Align\n");
+    Elf32_Ehdr *h = (Elf32_Ehdr *)map_start;
+
+    foreach_phdr(map_start, load_phdr, fd); 
+    startup(argc - 1, argv + 1, (void *)(h->e_entry));
+
+    // FILE *file = fopen(argv[1], "rb");
+    // if (!file) {
+    //     perror("Error opening file");
+    //     return 1;
+    // }
+
+    // // Get the file size
+    // fseek(file, 0, SEEK_END);
+    // long file_size = ftell(file);
+    // fseek(file, 0, SEEK_SET);
+
+    // void *map_start;
+    // struct stat fd_stat;
+
+    // if (fstat(file, &fd_stat) == -1)
+    // {
+    //     perror("fstat");
+    //     close(file);
+    // }
+
+    // if ((map_start = mmap(0, fd_stat.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0)) == MAP_FAILED)
+    // {
+    //     perror("mmap failed");
+    //     exit(EXIT_FAILURE);
+    // }
+
+    // Elf32_Ehdr *h = (Elf32_Ehdr *)map_start;
+
+    // foreach_phdr(map_start, load_phdr, file); 
+    // startup(argc - 1, argv + 1, (void *)(h->e_entry));
 
     // Map the ELF file into memory
-    void *map_start = malloc(file_size);
-    if (!map_start) {
-        perror("Error allocating memory");
-        fclose(file);
-        return 1;
-    }
+    // void *map_start = malloc(file_size);
+    // if (!map_start) {
+    //     perror("Error allocating memory");
+    //     fclose(file);
+    //     return 1;
+    // }
 
-    fread(map_start, 1, file_size, file);
-    fclose(file);
+    // fread(map_start, 1, file_size, file);
+    // fclose(file);
 
-    // Apply the iterator function
-    int result = foreach_phdr(map_start, print_phdr_info, 0);
+    // // Apply the iterator function
+    // int result = foreach_phdr(map_start, print_phdr_info, 0);
 
-    // Cleanup
-    free(map_start);
-    return result;
+    // // Cleanup
+    // free(map_start);
+    // return result;
 
     return 0;
 }
