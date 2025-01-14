@@ -63,141 +63,123 @@ void print_phdr_info(Elf32_Phdr *phdr, int index) {
            phdr->p_align);
 }
 
+//this point!
 
-int foreach_phdr(void *map_start, void (*func)(Elf32_Phdr *,int), int arg){
-    Elf32_Ehdr *ehdr = (Elf32_Ehdr *)map_start;
-    //assuming that got a 32-bit ELF file
-    Elf32_Phdr *phdr_table = (Elf32_Phdr *)((char *)map_start + ehdr->e_phoff);
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-        func(phdr_table + i, i); // Apply the function to each program header
+/* Minimal write for printing errors, since we're not using libc: */
+static void write_str(const char *s) {
+    while (*s) {
+        write(2, s, 1);  /* fd=2 is stderr */
+        s++;
     }
-
-    return 0;
 }
 
-int protection_Map(int flag)
-{
-    if (flag == 0)
-        return 0;
-    if (flag == 1)
-        return PROT_EXEC;
-    if (flag == 2)
-        return PROT_WRITE;
-    if (flag == 3)
-        return PROT_WRITE | PROT_EXEC;
-    if (flag == 4)
-        return PROT_READ;
-    if (flag == 5)
-        return PROT_READ | PROT_EXEC;
-    if (flag == 6)
-        return PROT_READ | PROT_WRITE;
-    if (flag == 7)
-        return PROT_READ | PROT_WRITE | PROT_EXEC;
-    return -1;
+/* Convert p_flags (PF_R, PF_W, PF_X) to mmap PROT_* flags. */
+int phdr_to_prot(Elf32_Word p_flags) {
+    int prot = 0;
+    if (p_flags & PF_R) prot |= PROT_READ;
+    if (p_flags & PF_W) prot |= PROT_WRITE;
+    if (p_flags & PF_X) prot |= PROT_EXEC;
+    return prot;
 }
 
-void load_phdr(Elf32_Phdr *phdr, int fd) //map a program header segment into memory
+/* For each PT_LOAD header, do a MAP_FIXED mmap at p_vaddr (page-aligned). */
+static void load_phdr(Elf32_Phdr *phdr, int fd)
 {
-    
-    if (phdr->p_type == PT_LOAD)
-    {
-        print_phdr_info(phdr, 0);
-        void *vadd = (void *)(phdr->p_vaddr & 0xfffff000);
-        int offset = phdr->p_offset & 0xfffff000;
-        int padding = phdr->p_vaddr & 0xfff;
-        int convertedFlag = protection_Map(phdr->p_flags);
-        if (mmap(vadd, phdr->p_memsz + padding, convertedFlag, MAP_FIXED | MAP_PRIVATE, fd, offset) == MAP_FAILED)
-        {
-            perror("mmap failed1");
-            exit(-1);
+    if (phdr->p_type == PT_LOAD) {
+        /* Align everything to page boundary (0x1000). */
+        unsigned long page_size = 0x1000;  /* or sysconf(_SC_PAGE_SIZE) */
+        unsigned long vaddr_aligned  = phdr->p_vaddr & ~(page_size - 1);
+        unsigned long offset_aligned = phdr->p_offset & ~(page_size - 1);
+
+        /* Extra offset within the page. E.g. if p_vaddr = 0x08048004, 
+           then 'padding' is 4. We'll map p_filesz + that. */
+        unsigned long padding = phdr->p_vaddr & (page_size - 1);
+        unsigned long length  = phdr->p_filesz + padding;  
+        
+        /* Convert flags from ELF to mmap protections. */
+        int prot = phdr_to_prot(phdr->p_flags);
+
+        /* Map from 'offset_aligned' in the file, at 'vaddr_aligned' in memory. */
+        void *map_addr = mmap((void*)vaddr_aligned, length, prot,
+                              MAP_PRIVATE | MAP_FIXED, fd, offset_aligned);
+        if (map_addr == (void*)-1) {
+            write_str("mmap failed\n");
+            _exit(1);  /* _exit via syscall, or use your own error path */
         }
+
     }
 }
 
+/* Iterate over all program headers and call load_phdr on each. */
+static void foreach_phdr(void *map_start, int fd)
+{
+    Elf32_Ehdr *ehdr = (Elf32_Ehdr*)map_start;
+    Elf32_Phdr *phdr_table = (Elf32_Phdr*)((char*)map_start + ehdr->e_phoff);
+    int i;
+    for (i = 0; i < ehdr->e_phnum; i++) {
+        load_phdr(&phdr_table[i], fd);
+    }
+}
 
-
-int main(int argc, char** argv){
-    if(argc != 2){
-        printf("wrong arguments number!\n");
+/* Minimal entry point of the loader */
+int main(int argc, char **argv)
+{
+    if (argc < 2) {
+        write_str("Usage: loader <ELF file>\n");
         return 1;
     }
 
+    printf("%d",argc);
+
+    /* Open the ELF file */
     int fd = open(argv[1], O_RDONLY);
-    if(fd < 0) {
-        perror("open failed");
+    if (fd < 0) {
+        write_str("open failed\n");
         return 1;
     }
 
-    struct stat fd_stat;
-    if (fstat(fd, &fd_stat) == -1)
-    {
-        perror("fstat");
+    /* Get file size with fstat */
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        write_str("fstat failed\n");
         close(fd);
         return 1;
     }
-    void *map_start =mmap(0, fd_stat.st_size, PROT_READ , MAP_PRIVATE, fd, 0);
 
-    if (map_start == MAP_FAILED)
-    {
-        perror("mmap failed");
+    /* mmap the entire file read-only (so we can read the headers). */
+    void *map_start = mmap(0, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map_start == (void*)-1) {
+        write_str("mmap for file reading failed\n");
         close(fd);
-        exit(EXIT_FAILURE);
+        return 1;
     }
 
-    printf("Type Offset VirtAddr PhysAddr FileSiz MemSiz Flg Align\n");
-    Elf32_Ehdr *h = (Elf32_Ehdr *)map_start;
+    /* Check the ELF header is for a 32-bit, etc. (Optional checks) */
+    Elf32_Ehdr *ehdr = (Elf32_Ehdr*)map_start;
+    if (ehdr->e_ident[0] != 0x7f || 
+        ehdr->e_ident[1] != 'E'  ||
+        ehdr->e_ident[2] != 'L'  ||
+        ehdr->e_ident[3] != 'F') 
+    {
+        write_str("Not an ELF file\n");
+        _exit(1);
+    }
 
-    foreach_phdr(map_start, load_phdr, fd); 
-    startup(argc - 1, argv + 1, (void *)(h->e_entry));
+    /* Now map each PT_LOAD segment at its desired address. */
+    foreach_phdr(map_start, fd);
 
-    // FILE *file = fopen(argv[1], "rb");
-    // if (!file) {
-    //     perror("Error opening file");
-    //     return 1;
-    // }
+    /* We have loaded the code. The entry point is e_entry. 
+       We transfer control using the 'startup' assembly glue. */
+    void (*entry_point)(void) = (void(*)(void))ehdr->e_entry;
 
-    // // Get the file size
-    // fseek(file, 0, SEEK_END);
-    // long file_size = ftell(file);
-    // fseek(file, 0, SEEK_SET);
+    /* startup(argc-1, argv+1, entry_point):
+       - The 'startup' function sets up a basic stack for the loaded code,
+         and calls 'entry_point' with the requested argv (skipping loader's argv[0]). 
+     */
+    startup(argc - 1, argv + 1, (void*)entry_point);
 
-    // void *map_start;
-    // struct stat fd_stat;
-
-    // if (fstat(file, &fd_stat) == -1)
-    // {
-    //     perror("fstat");
-    //     close(file);
-    // }
-
-    // if ((map_start = mmap(0, fd_stat.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0)) == MAP_FAILED)
-    // {
-    //     perror("mmap failed");
-    //     exit(EXIT_FAILURE);
-    // }
-
-    // Elf32_Ehdr *h = (Elf32_Ehdr *)map_start;
-
-    // foreach_phdr(map_start, load_phdr, file); 
-    // startup(argc - 1, argv + 1, (void *)(h->e_entry));
-
-    // Map the ELF file into memory
-    // void *map_start = malloc(file_size);
-    // if (!map_start) {
-    //     perror("Error allocating memory");
-    //     fclose(file);
-    //     return 1;
-    // }
-
-    // fread(map_start, 1, file_size, file);
-    // fclose(file);
-
-    // // Apply the iterator function
-    // int result = foreach_phdr(map_start, print_phdr_info, 0);
-
-    // // Cleanup
-    // free(map_start);
-    // return result;
-
-    return 0;
+    /* Usually won't reach here if the loaded program calls exit.
+       But just in case: */
+    _exit(0);
+    return 0; /* unreachable */
 }
